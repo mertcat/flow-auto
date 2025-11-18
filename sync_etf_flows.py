@@ -16,10 +16,11 @@ Date: 2025-11-17
 """
 
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 from typing import Dict, Any, Optional
+import yfinance as yf
 
 
 def create_flow_lookup(source_file: str) -> Dict[str, float]:
@@ -154,10 +155,152 @@ def parse_multiplier_from_column_name(column_name: str) -> float:
     return 1.0
 
 
+def get_vwap_ticker_for_sheet(sheet_name: str) -> Optional[str]:
+    """
+    Get the ticker symbol to use for VWAP calculation for a given sheet.
+
+    Args:
+        sheet_name: Name of the Excel sheet
+
+    Returns:
+        Ticker symbol (e.g., "SPY", "QQQ", "TSLA") or None if not found
+    """
+    # Mapping of sheet names to ticker symbols for VWAP
+    vwap_mapping = {
+        'S&P 500 ETF': 'SPY',
+        'Nasdaq 100 ETF': 'NDX',
+        'Russel 2000 ETF': 'RUT',
+        'Bonds': 'TLT',
+        'Gold ETF': 'GC=F',
+        'Silver ETF': 'SI=F',
+        'Brent ETF': 'BNO',
+        'Natural Gas': 'NG=F',
+        'Palladium ETF': 'PA=F',
+        'Platinum ETF': 'PL=F',
+        'Copper ETF': 'XCU',
+        'SEMIC': 'SMH',
+        'NVDA': 'NVDA',
+        'AVGO': 'AVGO',
+        'TSLA': 'TSLA',
+        'META': 'META',
+        'AAPL': 'AAPL',
+        'MSFT': 'MSFT',
+        'GOOG': 'GOOG',
+        'PANW': 'PANW',
+        'IBIT': 'IBIT',
+        'ETHA': 'ETHA',
+        'SOL': 'SOL',
+        'BOFA': 'BAC',
+    }
+
+    return vwap_mapping.get(sheet_name)
+
+
+def calculate_vwap(df: pd.DataFrame) -> Optional[float]:
+    """
+    Calculate VWAP (Volume Weighted Average Price) for a DataFrame.
+    Similar to pandas_ta.vwap() but simplified.
+
+    VWAP = Σ(Typical_Price × Volume) / Σ(Volume)
+    where Typical_Price = (High + Low + Close) / 3
+
+    Args:
+        df: DataFrame with OHLCV data
+
+    Returns:
+        Last VWAP value or None if calculation fails
+    """
+    try:
+        if df.empty or 'Volume' not in df.columns:
+            return None
+
+        # Calculate Typical Price (HLC/3)
+        df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+
+        # Calculate cumulative (Typical_Price * Volume) and cumulative Volume
+        df['TP_Volume'] = df['Typical_Price'] * df['Volume']
+        df['Cum_TP_Volume'] = df['TP_Volume'].cumsum()
+        df['Cum_Volume'] = df['Volume'].cumsum()
+
+        # Calculate VWAP
+        df['VWAP'] = df['Cum_TP_Volume'] / df['Cum_Volume']
+
+        # Return the last VWAP value
+        return df['VWAP'].iloc[-1]
+
+    except Exception as e:
+        return None
+
+
+def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
+    """
+    Fetch VWAP (Volume Weighted Average Price) for a ticker on a specific date.
+    Uses pandas-ta style calculation.
+
+    Args:
+        ticker: Ticker symbol (e.g., "SPY", "TSLA")
+        date: Date in YYYY-MM-DD format
+
+    Returns:
+        VWAP value or None if data not available
+    """
+    try:
+        # Convert date string to datetime
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+        stock = yf.Ticker(ticker)
+
+        # Try to fetch intraday data for better VWAP calculation
+        try:
+            df = stock.history(start=date,
+                              end=(target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+                              interval='5m')
+
+            if not df.empty and len(df) > 1:
+                df = df.dropna()
+
+                # 💥 SINGLE-LINE VWAP CALCULATION (pandas-ta style) 💥
+                vwap_value = calculate_vwap(df)
+
+                if vwap_value is not None:
+                    return round(vwap_value, 2)
+        except:
+            pass  # Fall back to daily data
+
+        # Fallback: Use daily data if intraday is not available
+        start_date = target_date - timedelta(days=5)
+        end_date = target_date + timedelta(days=1)
+
+        df = stock.history(start=start_date.strftime("%Y-%m-%d"),
+                          end=end_date.strftime("%Y-%m-%d"))
+
+        if df.empty:
+            print(f"[WARNING] No price data found for {ticker} on {date}")
+            return None
+
+        # Find the row for our target date
+        df.index = pd.to_datetime(df.index).date
+        target_date_obj = target_date.date()
+
+        if target_date_obj not in df.index:
+            print(f"[WARNING] No price data for {ticker} on {date} (market closed?)")
+            return None
+
+        row = df.loc[target_date_obj]
+
+        # For daily data, use typical price
+        vwap = (row['High'] + row['Low'] + row['Close']) / 3
+
+        return round(vwap, 2)
+
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch VWAP for {ticker} on {date}: {str(e)}")
+        return None
+
+
 def calculate_adjusted_total_flow(df: pd.DataFrame, row_idx: int, job_config: Dict[str, Any]) -> float:
     """
     Calculate the Adjusted Total Flow for a row by summing all flow columns except VWAP.
-    Applies multipliers for leveraged ETFs (e.g., 3x L = multiply by 3, 3x S = multiply by -3).
+    Note: Values in columns are already multiplied by their leverage factors, so just sum them.
 
     Args:
         df: DataFrame containing the sheet data
@@ -165,34 +308,30 @@ def calculate_adjusted_total_flow(df: pd.DataFrame, row_idx: int, job_config: Di
         job_config: Job configuration containing column information
 
     Returns:
-        The sum of all flow values with multipliers applied (excluding VWAP column)
+        The sum of all flow values (already multiplied, excluding VWAP column)
     """
     job_type = job_config['type']
     total = 0.0
 
     if job_type == 'complex':
-        # For complex types, sum all mapped columns with multipliers
+        # For complex types, sum all mapped columns (already multiplied)
         mapping = job_config.get('mapping', {})
         for column_name in mapping.keys():
             if column_name in df.columns:
                 value = df.at[row_idx, column_name]
                 if pd.notna(value):
                     try:
-                        flow_value = float(value)
-                        multiplier = parse_multiplier_from_column_name(column_name)
-                        total += flow_value * multiplier
+                        total += float(value)
                     except (ValueError, TypeError):
                         pass
     elif job_type == 'simple':
-        # For simple types, just get the single flow column value
+        # For simple types, just get the single flow column value (already multiplied)
         flow_column = job_config.get('flow_column')
         if flow_column and flow_column in df.columns:
             value = df.at[row_idx, flow_column]
             if pd.notna(value):
                 try:
-                    flow_value = float(value)
-                    multiplier = parse_multiplier_from_column_name(flow_column)
-                    total = flow_value * multiplier
+                    total = float(value)
                 except (ValueError, TypeError):
                     pass
 
@@ -287,18 +426,18 @@ def update_statistics_table(df: pd.DataFrame, sheet_name: str, adjusted_total_co
     return df
 
 
-def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_date: str) -> None:
+def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_date: str) -> None:
     """
     Process a single destination file and update it with new flow data.
 
     This function implements the "upsert" logic:
-    - If a row for today exists, UPDATE the flow values in place
-    - If no row exists for today, APPEND a new row with the date and flow values
+    - If a row for the target date exists, UPDATE the flow values in place
+    - If no row exists for the target date, APPEND a new row with the date and flow values
 
     Args:
         job_config: Configuration dictionary containing file_path, type, and mapping/ticker info
         flow_map: Dictionary mapping ticker symbols to flow values
-        today_date: Today's date in YYYY-MM-DD format
+        target_date: Target date in YYYY-MM-DD format (usually yesterday's date)
 
     Raises:
         FileNotFoundError: If the destination file doesn't exist
@@ -336,8 +475,8 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
         # Convert Date column to string format for comparison
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
 
-        # Check if a row for today already exists
-        existing_row_mask = df['Date'] == today_date
+        # Check if a row for the target date already exists
+        existing_row_mask = df['Date'] == target_date
         row_exists = existing_row_mask.any()
 
         if job_type == 'complex':
@@ -352,7 +491,7 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
 
             if row_exists:
                 # UPDATE existing row
-                print(f"[INFO] Updating existing row for date: {today_date}")
+                print(f"[INFO] Updating existing row for date: {target_date}")
                 row_idx = df[existing_row_mask].index[0]
 
                 for column_name, ticker in mapping.items():
@@ -361,7 +500,11 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
                         continue
 
                     if ticker in flow_map:
-                        df.at[row_idx, column_name] = flow_map[ticker]
+                        # Get raw value and multiply by leverage factor
+                        raw_value = flow_map[ticker]
+                        multiplier = parse_multiplier_from_column_name(column_name)
+                        multiplied_value = raw_value * multiplier
+                        df.at[row_idx, column_name] = multiplied_value
                         updates_made += 1
                     else:
                         print(f"[WARNING] Ticker '{ticker}' not found in flow map, using 0.0")
@@ -370,17 +513,21 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
                 print(f"[INFO] Updated {updates_made} column(s)")
             else:
                 # APPEND new row
-                print(f"[INFO] Appending new row for date: {today_date}")
+                print(f"[INFO] Appending new row for date: {target_date}")
 
                 # Create a new row with all columns set to pd.NA initially
                 new_row = {col: pd.NA for col in df.columns}
-                new_row['Date'] = today_date
+                new_row['Date'] = target_date
 
                 # Fill in the mapped columns
                 for column_name, ticker in mapping.items():
                     if column_name in df.columns:
                         if ticker in flow_map:
-                            new_row[column_name] = flow_map[ticker]
+                            # Get raw value and multiply by leverage factor
+                            raw_value = flow_map[ticker]
+                            multiplier = parse_multiplier_from_column_name(column_name)
+                            multiplied_value = raw_value * multiplier
+                            new_row[column_name] = multiplied_value
                             updates_made += 1
                         else:
                             print(f"[WARNING] Ticker '{ticker}' not found in flow map, using 0.0")
@@ -403,24 +550,28 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
                 print(f"[ERROR] Flow column '{flow_column}' not found in sheet '{sheet_name}'")
                 return
 
-            flow_value = flow_map.get(ticker)
-            if flow_value is None:
+            raw_value = flow_map.get(ticker)
+            if raw_value is None:
                 print(f"[WARNING] Ticker '{ticker}' not found in flow map, using 0.0")
-                flow_value = 0.0
+                raw_value = 0.0
+
+            # Apply multiplier to the value before storing
+            multiplier = parse_multiplier_from_column_name(flow_column)
+            flow_value = raw_value * multiplier
 
             if row_exists:
                 # UPDATE existing row
-                print(f"[INFO] Updating existing row for date: {today_date}")
+                print(f"[INFO] Updating existing row for date: {target_date}")
                 row_idx = df[existing_row_mask].index[0]
                 df.at[row_idx, flow_column] = flow_value
                 print(f"[INFO] Updated column '{flow_column}' with value: {flow_value}")
             else:
                 # APPEND new row
-                print(f"[INFO] Appending new row for date: {today_date}")
+                print(f"[INFO] Appending new row for date: {target_date}")
 
                 # Create a new row with all columns set to pd.NA initially
                 new_row = {col: pd.NA for col in df.columns}
-                new_row['Date'] = today_date
+                new_row['Date'] = target_date
                 new_row[flow_column] = flow_value
 
                 # Append the new row using loc to avoid FutureWarning
@@ -431,17 +582,36 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
             print(f"[ERROR] Unknown job type: {job_type}")
             return
 
+        # Fetch and fill VWAP value for this date
+        # Find VWAP column
+        vwap_col = None
+        for col in df.columns:
+            # Find VWAP column but exclude Product column
+            if 'vwap' in str(col).lower() and 'product' not in str(col).lower():
+                vwap_col = col
+                break
+
+        if vwap_col:
+            # Get the ticker for VWAP
+            vwap_ticker = get_vwap_ticker_for_sheet(sheet_name)
+            if vwap_ticker:
+                vwap_value = fetch_vwap_for_date(vwap_ticker, target_date)
+                if vwap_value is not None:
+                    if row_exists:
+                        row_idx = df[existing_row_mask].index[0]
+                    else:
+                        row_idx = len(df) - 1  # The newly appended row
+
+                    df.at[row_idx, vwap_col] = vwap_value
+                    print(f"[INFO] Set {vwap_col} = {vwap_value} (from {vwap_ticker})")
+
         # Calculate and fill Adjusted Total Flow for the current row
         # Find the Adjusted Total Flow column (could be named differently per sheet)
         adjusted_total_col = None
-        vwap_col = None
 
         for col in df.columns:
             if 'adjusted total' in str(col).lower() or (job_type == 'simple' and str(col).lower() == 'flow'):
                 adjusted_total_col = col
-            # Find VWAP column but exclude Product column
-            if 'vwap' in str(col).lower() and 'product' not in str(col).lower():
-                vwap_col = col
 
         if adjusted_total_col:
             if row_exists:
@@ -455,8 +625,15 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], today_d
             print(f"[INFO] Set {adjusted_total_col} = {adjusted_total_value}")
 
         # Update statistics table (LAST DAY, LAST 5 DAYS, LAST 20 DAYS)
+        # Re-find vwap_col for statistics update
+        vwap_col_for_stats = None
+        for col in df.columns:
+            if 'vwap' in str(col).lower() and 'product' not in str(col).lower():
+                vwap_col_for_stats = col
+                break
+
         if adjusted_total_col:
-            df = update_statistics_table(df, sheet_name, adjusted_total_col, vwap_col)
+            df = update_statistics_table(df, sheet_name, adjusted_total_col, vwap_col_for_stats)
 
         # Save the updated DataFrame back to the Excel sheet
         # We need to read all sheets, update the specific one, and write back
@@ -743,9 +920,9 @@ def main():
         },
     ]
 
-    # Get today's date
-    today_date = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n[INFO] Processing date: {today_date}")
+    # Get yesterday's date
+    yesterday_date = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"\n[INFO] Processing date: {yesterday_date} (yesterday)")
 
     # Step 1: Create the flow lookup map from the source file
     try:
@@ -769,7 +946,7 @@ def main():
         print(f"{'='*80}")
 
         try:
-            process_file(job, flow_map, today_date)
+            process_file(job, flow_map, yesterday_date)
             success_count += 1
         except Exception as e:
             print(f"[ERROR] Job failed: {str(e)}")

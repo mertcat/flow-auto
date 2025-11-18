@@ -34,13 +34,34 @@ Save File: It saves the updated data back to the DESTINATION_FILE as a CSV.
 
 3. Requirements & Setup
 
-Before you can run the script, you need two things:
+Before you can run the script, you need:
 
-Python 3: If you don't have it, you can download it from python.org.
+**Python 3**: If you don't have it, you can download it from python.org.
 
-Pandas Library: This is the library used to read and write spreadsheet data. You can install it by opening a terminal or command prompt and running:
+**Install Dependencies**: Install all required Python packages by running:
 
-pip install pandas
+```bash
+pip install -r requirements.txt
+```
+
+This will install:
+- pandas (data manipulation)
+- openpyxl (Excel file handling)
+- alpha-vantage (market data API)
+- pandas-ta (technical analysis for VWAP)
+
+**Alpha Vantage API Key** (Required for VWAP data):
+
+1. Get your FREE API key from: https://www.alphavantage.co/support/#api-key
+2. Open `sync_etf_flows.py` in a text editor
+3. Find line ~31 that says:
+   ```python
+   ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY_HERE"
+   ```
+4. Replace `YOUR_ALPHA_VANTAGE_API_KEY_HERE` with your actual API key
+5. Save the file
+
+**Note:** Alpha Vantage free tier allows 5 API calls per minute. The script automatically handles rate limiting.
 
 
 4. File Structure

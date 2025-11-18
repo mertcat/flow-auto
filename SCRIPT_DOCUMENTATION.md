@@ -2,13 +2,44 @@
 
 ## Overview
 
-This automated Python script synchronizes daily ETF flow data from a Bloomberg export file to multiple tracking sheets in an Excel workbook. The script implements intelligent "upsert" logic that updates existing records or appends new ones as needed.
+This automated Python script synchronizes daily ETF flow data from a Bloomberg export file to multiple tracking sheets in an Excel workbook. The script implements intelligent "upsert" logic that updates existing records or appends new ones as needed. It also fetches real-time VWAP (Volume Weighted Average Price) data using the Alpha Vantage API.
 
 ## Files Created
 
-1. **sync_etf_flows.py** - Main automation script (320 lines)
+1. **sync_etf_flows.py** - Main automation script (400+ lines)
 2. **requirements.txt** - Python package dependencies
 3. **SCRIPT_DOCUMENTATION.md** - This documentation file
+4. **run.sh** - Mac execution script
+5. **run.command** - Double-clickable Mac script
+
+## Setup & Configuration
+
+### 1. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Required packages:
+- `pandas>=2.0.0` - Data manipulation
+- `openpyxl>=3.1.0` - Excel file handling
+- `alpha-vantage>=2.3.1` - Real-time market data API
+- `pandas-ta>=0.3.14b` - Technical analysis (VWAP calculation)
+
+### 2. Get Alpha Vantage API Key
+
+The script uses Alpha Vantage to fetch VWAP data for tickers.
+
+1. Get your **FREE** API key from: https://www.alphavantage.co/support/#api-key
+2. Open `sync_etf_flows.py` in a text editor
+3. Find this line (around line 31):
+   ```python
+   ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY_HERE"
+   ```
+4. Replace `YOUR_ALPHA_VANTAGE_API_KEY_HERE` with your actual API key
+5. Save the file
+
+**Rate Limits:** Alpha Vantage free tier allows 5 API calls per minute. The script automatically applies 13-second delays between calls to respect this limit.
 
 ## Features
 

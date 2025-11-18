@@ -167,17 +167,17 @@ def get_vwap_ticker_for_sheet(sheet_name: str) -> Optional[str]:
     """
     # Mapping of sheet names to ticker symbols for VWAP
     vwap_mapping = {
-        'S&P 500 ETF': 'SPY',
-        'Nasdaq 100 ETF': 'NDX',
-        'Russel 2000 ETF': 'RUT',
+        'S&P 500 ETF': 'ES=F',
+        'Nasdaq 100 ETF': 'NQ=F',
+        'Russel 2000 ETF': 'RTY=F',
         'Bonds': 'TLT',
         'Gold ETF': 'GC=F',
         'Silver ETF': 'SI=F',
-        'Brent ETF': 'BNO',
+        'Brent ETF': 'BZ=F',
         'Natural Gas': 'NG=F',
         'Palladium ETF': 'PA=F',
         'Platinum ETF': 'PL=F',
-        'Copper ETF': 'XCU',
+        'Copper ETF': 'HG=F',
         'SEMIC': 'SMH',
         'NVDA': 'NVDA',
         'AVGO': 'AVGO',
@@ -189,7 +189,7 @@ def get_vwap_ticker_for_sheet(sheet_name: str) -> Optional[str]:
         'PANW': 'PANW',
         'IBIT': 'IBIT',
         'ETHA': 'ETHA',
-        'SOL': 'SOL',
+        'SOL': 'SOL-USD',
         'BOFA': 'BAC',
     }
 
@@ -214,6 +214,9 @@ def calculate_vwap(df: pd.DataFrame) -> Optional[float]:
         if df.empty or 'Volume' not in df.columns:
             return None
 
+        # Make an explicit copy to avoid SettingWithCopyWarning
+        df = df.copy()
+
         # Calculate Typical Price (HLC/3)
         df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
 
@@ -234,11 +237,11 @@ def calculate_vwap(df: pd.DataFrame) -> Optional[float]:
 
 def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
     """
-    Fetch VWAP (Volume Weighted Average Price) for a ticker on a specific date.
-    Uses pandas-ta style calculation.
+    Fetch VWAP (Volume Weighted Average Price) for a ticker on a specific date using yfinance.
+    Uses custom cumulative VWAP calculation.
 
     Args:
-        ticker: Ticker symbol (e.g., "SPY", "TSLA")
+        ticker: Ticker symbol (e.g., "SPY", "TSLA", "GC=F", "SI=F")
         date: Date in YYYY-MM-DD format
 
     Returns:
@@ -258,7 +261,7 @@ def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
             if not df.empty and len(df) > 1:
                 df = df.dropna()
 
-                # 💥 SINGLE-LINE VWAP CALCULATION (pandas-ta style) 💥
+                # Calculate VWAP using custom function
                 vwap_value = calculate_vwap(df)
 
                 if vwap_value is not None:
@@ -387,12 +390,40 @@ def update_statistics_table(df: pd.DataFrame, sheet_name: str, adjusted_total_co
         stats['last_20_days_flow'] = last_20_days_data[adjusted_total_col].sum()
 
         if vwap_col and vwap_col in valid_data.columns:
-            # Calculate VWAP average only from rows that have VWAP values
-            last_5_vwap = last_5_days_data[last_5_days_data[vwap_col].notna()][vwap_col]
-            last_20_vwap = last_20_days_data[last_20_days_data[vwap_col].notna()][vwap_col]
+            # Find Product column
+            product_col = None
+            for col in df.columns:
+                if 'product' in str(col).lower():
+                    product_col = col
+                    break
 
-            stats['last_5_days_vwap'] = last_5_vwap.mean() if len(last_5_vwap) > 0 else 0.0
-            stats['last_20_days_vwap'] = last_20_vwap.mean() if len(last_20_vwap) > 0 else 0.0
+            # Calculate weighted average VWAP using Product column
+            # Weighted Average VWAP = Sum(Products) / Sum(Adjusted Totals)
+            if product_col and product_col in valid_data.columns:
+                # For LAST 5 DAYS
+                last_5_products = last_5_days_data[last_5_days_data[product_col].notna()][product_col]
+                last_5_flows = last_5_days_data[last_5_days_data[product_col].notna()][adjusted_total_col]
+
+                if len(last_5_products) > 0 and last_5_flows.sum() != 0:
+                    stats['last_5_days_vwap'] = last_5_products.sum() / last_5_flows.sum()
+                else:
+                    stats['last_5_days_vwap'] = 0.0
+
+                # For LAST 20 DAYS
+                last_20_products = last_20_days_data[last_20_days_data[product_col].notna()][product_col]
+                last_20_flows = last_20_days_data[last_20_days_data[product_col].notna()][adjusted_total_col]
+
+                if len(last_20_products) > 0 and last_20_flows.sum() != 0:
+                    stats['last_20_days_vwap'] = last_20_products.sum() / last_20_flows.sum()
+                else:
+                    stats['last_20_days_vwap'] = 0.0
+            else:
+                # Fallback to simple average if Product column not found
+                last_5_vwap = last_5_days_data[last_5_days_data[vwap_col].notna()][vwap_col]
+                last_20_vwap = last_20_days_data[last_20_days_data[vwap_col].notna()][vwap_col]
+
+                stats['last_5_days_vwap'] = last_5_vwap.mean() if len(last_5_vwap) > 0 else 0.0
+                stats['last_20_days_vwap'] = last_20_vwap.mean() if len(last_20_vwap) > 0 else 0.0
 
     # Find and update statistics table rows
     # Look for cells containing "LAST DAY", "LAST 5 DAYS", "LAST 20 DAYS"
@@ -472,11 +503,19 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
             print(f"[ERROR] 'Date' column not found in sheet '{sheet_name}'")
             return
 
-        # Convert Date column to string format for comparison
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+        # Store original Date column format before conversion
+        original_dates = df['Date'].copy()
 
-        # Check if a row for the target date already exists
-        existing_row_mask = df['Date'] == target_date
+        # Convert Date column to datetime with flexible parsing (handles DD.MM.YYYY, YYYY-MM-DD, etc.)
+        # dayfirst=True handles European date format like 17.11.2025
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True)
+
+        # Convert target_date to datetime
+        target_date_dt = pd.to_datetime(target_date)
+
+        # Check if a row for the target date already exists (comparing datetime, will match regardless of time)
+        # Normalize both to date only for comparison
+        existing_row_mask = df['Date'].dt.date == target_date_dt.date()
         row_exists = existing_row_mask.any()
 
         if job_type == 'complex':
@@ -517,7 +556,7 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
 
                 # Create a new row with all columns set to pd.NA initially
                 new_row = {col: pd.NA for col in df.columns}
-                new_row['Date'] = target_date
+                new_row['Date'] = target_date_dt
 
                 # Fill in the mapped columns
                 for column_name, ticker in mapping.items():
@@ -571,7 +610,7 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
 
                 # Create a new row with all columns set to pd.NA initially
                 new_row = {col: pd.NA for col in df.columns}
-                new_row['Date'] = target_date
+                new_row['Date'] = target_date_dt
                 new_row[flow_column] = flow_value
 
                 # Append the new row using loc to avoid FutureWarning
@@ -584,12 +623,21 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
 
         # Fetch and fill VWAP value for this date
         # Find VWAP column
+        # First try to find column with "vwap" in name
+        # If not found, try to find column matching sheet name (for NVDA, GOOG, AAPL, PANW, etc.)
         vwap_col = None
         for col in df.columns:
             # Find VWAP column but exclude Product column
             if 'vwap' in str(col).lower() and 'product' not in str(col).lower():
                 vwap_col = col
                 break
+
+        # If not found, check if column name matches sheet name (for ticker-specific sheets)
+        if not vwap_col:
+            for col in df.columns:
+                if str(col).strip().upper() == sheet_name.upper():
+                    vwap_col = col
+                    break
 
         if vwap_col:
             # Get the ticker for VWAP
@@ -624,26 +672,71 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
             df.at[row_idx, adjusted_total_col] = adjusted_total_value
             print(f"[INFO] Set {adjusted_total_col} = {adjusted_total_value}")
 
+        # Calculate and fill Product column (VWAP × Adjusted Total)
+        product_col = None
+        for col in df.columns:
+            if 'product' in str(col).lower():
+                product_col = col
+                break
+
+        if product_col and vwap_col and adjusted_total_col:
+            if row_exists:
+                row_idx = df[existing_row_mask].index[0]
+            else:
+                row_idx = len(df) - 1  # The newly appended row
+
+            # Get VWAP and Adjusted Total values
+            vwap_value = df.at[row_idx, vwap_col]
+            adjusted_total_value = df.at[row_idx, adjusted_total_col]
+
+            # Calculate Product = VWAP × Adjusted Total
+            if pd.notna(vwap_value) and pd.notna(adjusted_total_value):
+                product_value = float(vwap_value) * float(adjusted_total_value)
+                df.at[row_idx, product_col] = product_value
+                print(f"[INFO] Set {product_col} = {product_value}")
+
         # Update statistics table (LAST DAY, LAST 5 DAYS, LAST 20 DAYS)
-        # Re-find vwap_col for statistics update
+        # Re-find vwap_col for statistics update (same logic as above)
         vwap_col_for_stats = None
         for col in df.columns:
             if 'vwap' in str(col).lower() and 'product' not in str(col).lower():
                 vwap_col_for_stats = col
                 break
 
+        # If not found, check if column name matches sheet name (for ticker-specific sheets)
+        if not vwap_col_for_stats:
+            for col in df.columns:
+                if str(col).strip().upper() == sheet_name.upper():
+                    vwap_col_for_stats = col
+                    break
+
         if adjusted_total_col:
             df = update_statistics_table(df, sheet_name, adjusted_total_col, vwap_col_for_stats)
 
+        # Convert Date column to string format "DD MMM YYYY" (e.g., "17 Nov 2025")
+        # But preserve original format for certain sheets
+        preserve_date_format_sheets = ['BOFA']
+
+        if 'Date' in df.columns and sheet_name not in preserve_date_format_sheets:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%d %b %Y')
+
         # Save the updated DataFrame back to the Excel sheet
         # We need to read all sheets, update the specific one, and write back
+        preserve_date_format_sheets = ['BOFA']
+
         with pd.ExcelFile(workbook_name, engine='openpyxl') as xls:
-            all_sheets = {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+            all_sheets = {}
+            for sheet in xls.sheet_names:
+                # For sheets with preserved date format, read Date column as string
+                if sheet in preserve_date_format_sheets:
+                    all_sheets[sheet] = pd.read_excel(xls, sheet_name=sheet, dtype={'Date': str})
+                else:
+                    all_sheets[sheet] = pd.read_excel(xls, sheet_name=sheet)
 
         # Update the specific sheet
         all_sheets[sheet_name] = df
 
-        # Write all sheets back to the workbook
+        # Write all sheets back to the workbook (dates are now strings)
         with pd.ExcelWriter(workbook_name, engine='openpyxl', mode='w') as writer:
             for sheet, data in all_sheets.items():
                 data.to_excel(writer, sheet_name=sheet, index=False)
@@ -653,6 +746,299 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
     except Exception as e:
         print(f"[ERROR] Failed to process file: {str(e)}")
         raise
+
+
+def format_statistics_table_in_sheet(workbook_path: str, sheet_name: str) -> None:
+    """
+    Apply formatting to the statistics table in an individual sheet to match ALL sheet style.
+
+    Args:
+        workbook_path: Path to the Excel workbook
+        sheet_name: Name of the sheet to format
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    try:
+        wb = load_workbook(workbook_path)
+
+        if sheet_name not in wb.sheetnames:
+            return
+
+        ws = wb[sheet_name]
+
+        # Define styles matching ALL sheet
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        label_font = Font(bold=True, italic=True, size=10)
+        header_font = Font(italic=True, size=10)
+        center_align = Alignment(horizontal="center", vertical="center")
+        right_align = Alignment(horizontal="right", vertical="center")
+
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+        # Find and format statistics rows
+        statistics_labels = ["LAST DAY", "LAST 5 DAYS", "LAST 20 DAYS"]
+
+        for row_idx in range(1, ws.max_row + 1):
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell_value = str(cell.value).strip() if cell.value else ""
+
+                # Format statistics labels
+                if cell_value in statistics_labels:
+                    # Format the label cell
+                    cell.font = label_font
+                    cell.alignment = center_align
+                    cell.border = thin_border
+
+                    # Format the flow value (next column)
+                    flow_cell = ws.cell(row=row_idx, column=col_idx + 1)
+                    if flow_cell.value is not None and flow_cell.value != '':
+                        try:
+                            flow_val = float(flow_cell.value)
+                            flow_cell.alignment = right_align
+                            flow_cell.border = thin_border
+                            flow_cell.number_format = '#,##0.00'
+                            # Apply conditional formatting
+                            flow_cell.fill = green_fill if flow_val >= 0 else red_fill
+                        except (ValueError, TypeError):
+                            flow_cell.alignment = right_align
+                            flow_cell.border = thin_border
+
+                    # Format VWAP/Average cell (next next column)
+                    vwap_cell = ws.cell(row=row_idx, column=col_idx + 2)
+                    if vwap_cell.value is not None and vwap_cell.value != '':
+                        try:
+                            vwap_cell.alignment = right_align
+                            vwap_cell.border = thin_border
+                            vwap_cell.number_format = '#,##0.00'
+                        except:
+                            pass
+
+        wb.save(workbook_path)
+        print(f"[INFO] Applied table formatting to {sheet_name}")
+
+    except Exception as e:
+        print(f"[WARNING] Could not format statistics table in {sheet_name}: {str(e)}")
+
+
+def create_all_statistics_sheet(workbook_path: str, sheet_names: list) -> None:
+    """
+    Create an 'ALL' sheet with statistics dashboard for all tickers in grid layout.
+
+    Args:
+        workbook_path: Path to the Excel workbook
+        sheet_names: List of sheet names to collect statistics from
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    print(f"\n[INFO] Creating ALL statistics dashboard...")
+
+    # Read all sheets to collect statistics
+    all_stats = []
+
+    # Exclude these sheets from ALL
+    exclude_sheets = ['IBIT', 'SOL', 'ETHA', 'BOFA']
+
+    with pd.ExcelFile(workbook_path, engine='openpyxl') as xls:
+        for sheet_name in sheet_names:
+            # Skip excluded sheets
+            if sheet_name in exclude_sheets:
+                continue
+
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+
+                # Don't skip sheets without Date column - they might still have statistics
+                stats_data = {
+                    'ticker': sheet_name,
+                    'last_day_flow': None,
+                    'last_day_vwap': None,
+                    'last_5_flow': None,
+                    'last_5_vwap': None,
+                    'last_20_flow': None,
+                    'last_20_vwap': None
+                }
+
+                for idx, row in df.iterrows():
+                    for col in df.columns:
+                        cell_value = str(row[col]).strip() if pd.notna(row[col]) else ""
+                        col_idx = df.columns.get_loc(col)
+
+                        if cell_value == "LAST DAY":
+                            if col_idx + 1 < len(df.columns):
+                                stats_data['last_day_flow'] = row[df.columns[col_idx + 1]]
+                            if col_idx + 2 < len(df.columns):
+                                stats_data['last_day_vwap'] = row[df.columns[col_idx + 2]]
+
+                        elif cell_value == "LAST 5 DAYS":
+                            if col_idx + 1 < len(df.columns):
+                                stats_data['last_5_flow'] = row[df.columns[col_idx + 1]]
+                            if col_idx + 2 < len(df.columns):
+                                stats_data['last_5_vwap'] = row[df.columns[col_idx + 2]]
+
+                        elif cell_value == "LAST 20 DAYS":
+                            if col_idx + 1 < len(df.columns):
+                                stats_data['last_20_flow'] = row[df.columns[col_idx + 1]]
+                            if col_idx + 2 < len(df.columns):
+                                stats_data['last_20_vwap'] = row[df.columns[col_idx + 2]]
+
+                all_stats.append(stats_data)
+
+            except Exception as e:
+                print(f"[WARNING] Could not read statistics from {sheet_name}: {str(e)}")
+                continue
+
+    if not all_stats:
+        print("[WARNING] No statistics found to create ALL sheet")
+        return
+
+    # Create workbook and ALL sheet
+    wb = load_workbook(workbook_path)
+
+    if 'ALL' in wb.sheetnames:
+        del wb['ALL']
+
+    ws = wb.create_sheet('ALL', 0)
+
+    # Define styles
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    ticker_font = Font(bold=True, italic=True, color="FF0000", size=11)  # Red italic
+    header_font = Font(italic=True, bold=False, size=10)
+    label_font = Font(bold=True, italic=True, size=10)
+    center_align = Alignment(horizontal="center", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    # Grid layout: 4 columns of tables
+    tables_per_row = 4
+    table_width = 3  # columns per table
+    table_height = 4  # rows per table
+    col_spacing = 1  # space between tables
+    row_spacing = 1  # space between table rows
+
+    for idx, stats in enumerate(all_stats):
+        # Calculate position in grid
+        grid_col = idx % tables_per_row
+        grid_row = idx // tables_per_row
+
+        # Starting cell position
+        start_col = 1 + grid_col * (table_width + col_spacing)
+        start_row = 1 + grid_row * (table_height + row_spacing)
+
+        # Row 1: Ticker name and headers
+        # Cell A: Ticker name
+        cell = ws.cell(row=start_row, column=start_col)
+        cell.value = stats['ticker']
+        cell.font = ticker_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        # Cell B: "FLOW" header
+        cell = ws.cell(row=start_row, column=start_col + 1)
+        cell.value = "FLOW"
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        # Cell C: "AVERAGE" header
+        cell = ws.cell(row=start_row, column=start_col + 2)
+        cell.value = "AVERAGE"
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        # Row 2: LAST DAY
+        cell = ws.cell(row=start_row + 1, column=start_col)
+        cell.value = "LAST DAY"
+        cell.font = label_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        cell = ws.cell(row=start_row + 1, column=start_col + 1)
+        cell.value = stats['last_day_flow']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+        if cell.value is not None:
+            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+
+        cell = ws.cell(row=start_row + 1, column=start_col + 2)
+        cell.value = stats['last_day_vwap']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+
+        # Row 3: LAST 5 DAYS
+        cell = ws.cell(row=start_row + 2, column=start_col)
+        cell.value = "LAST 5 DAYS"
+        cell.font = label_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        cell = ws.cell(row=start_row + 2, column=start_col + 1)
+        cell.value = stats['last_5_flow']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+        if cell.value is not None:
+            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+
+        cell = ws.cell(row=start_row + 2, column=start_col + 2)
+        cell.value = stats['last_5_vwap']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+
+        # Row 4: LAST 20 DAYS
+        cell = ws.cell(row=start_row + 3, column=start_col)
+        cell.value = "LAST 20 DAYS"
+        cell.font = label_font
+        cell.alignment = center_align
+        cell.border = thin_border
+
+        cell = ws.cell(row=start_row + 3, column=start_col + 1)
+        cell.value = stats['last_20_flow']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+        if cell.value is not None:
+            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+
+        cell = ws.cell(row=start_row + 3, column=start_col + 2)
+        cell.value = stats['last_20_vwap']
+        cell.alignment = right_align
+        cell.border = thin_border
+        cell.number_format = '#,##0.00' if cell.value else ''
+
+    # Set column widths
+    for col in range(1, tables_per_row * (table_width + col_spacing) + 1):
+        if col % (table_width + col_spacing) == 1:  # Ticker column
+            ws.column_dimensions[get_column_letter(col)].width = 18
+        elif col % (table_width + col_spacing) == 2:  # Flow column
+            ws.column_dimensions[get_column_letter(col)].width = 12
+        elif col % (table_width + col_spacing) == 3:  # Average column
+            ws.column_dimensions[get_column_letter(col)].width = 12
+
+    wb.save(workbook_path)
+    print(f"[SUCCESS] Created ALL statistics dashboard with {len(all_stats)} ticker(s)")
 
 
 def main():
@@ -953,6 +1339,27 @@ def main():
             failure_count += 1
             # Continue to the next job even if this one failed
             continue
+
+    # Create ALL statistics sheet
+    try:
+        # Extract sheet names from job configurations
+        sheet_names = []
+        for job in ALL_JOBS:
+            file_path = job['file_path']
+            parts = file_path.split(' - ')
+            if len(parts) >= 2:
+                sheet_name = parts[1].replace('.csv', '').strip()
+                sheet_names.append(sheet_name)
+
+        # Get the workbook path
+        workbook_path = str(DESTINATION_DIR / DESTINATION_FILE)
+
+        # Create the ALL statistics dashboard
+        create_all_statistics_sheet(workbook_path, sheet_names)
+
+    except Exception as e:
+        print(f"[WARNING] Could not create ALL statistics sheet: {str(e)}")
+        # Don't fail the entire process if ALL sheet creation fails
 
     # Summary
     print(f"\n{'='*80}")

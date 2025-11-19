@@ -239,6 +239,7 @@ def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
     """
     Fetch VWAP (Volume Weighted Average Price) for a ticker on a specific date using yfinance.
     Uses custom cumulative VWAP calculation.
+    For S&P, NASDAQ, and Russel indices, uses (High + Low) / 2 instead.
 
     Args:
         ticker: Ticker symbol (e.g., "SPY", "TSLA", "GC=F", "SI=F")
@@ -252,22 +253,27 @@ def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
         target_date = datetime.strptime(date, "%Y-%m-%d")
         stock = yf.Ticker(ticker)
 
+        # Special tickers that use (High + Low) / 2 instead of VWAP
+        simple_avg_tickers = ['ES=F', 'NQ=F', 'RTY=F']
+        use_simple_avg = ticker in simple_avg_tickers
+
         # Try to fetch intraday data for better VWAP calculation
-        try:
-            df = stock.history(start=date,
-                              end=(target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
-                              interval='5m')
+        if not use_simple_avg:
+            try:
+                df = stock.history(start=date,
+                                  end=(target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+                                  interval='5m')
 
-            if not df.empty and len(df) > 1:
-                df = df.dropna()
+                if not df.empty and len(df) > 1:
+                    df = df.dropna()
 
-                # Calculate VWAP using custom function
-                vwap_value = calculate_vwap(df)
+                    # Calculate VWAP using custom function
+                    vwap_value = calculate_vwap(df)
 
-                if vwap_value is not None:
-                    return round(vwap_value, 2)
-        except:
-            pass  # Fall back to daily data
+                    if vwap_value is not None:
+                        return round(vwap_value, 2)
+            except:
+                pass  # Fall back to daily data
 
         # Fallback: Use daily data if intraday is not available
         start_date = target_date - timedelta(days=5)
@@ -290,8 +296,12 @@ def fetch_vwap_for_date(ticker: str, date: str) -> Optional[float]:
 
         row = df.loc[target_date_obj]
 
-        # For daily data, use typical price
-        vwap = (row['High'] + row['Low'] + row['Close']) / 3
+        # For S&P, NASDAQ, Russel: use (High + Low) / 2
+        # For others: use typical price (High + Low + Close) / 3
+        if use_simple_avg:
+            vwap = (row['High'] + row['Low']) / 2
+        else:
+            vwap = (row['High'] + row['Low'] + row['Close']) / 3
 
         return round(vwap, 2)
 
@@ -503,9 +513,6 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
             print(f"[ERROR] 'Date' column not found in sheet '{sheet_name}'")
             return
 
-        # Store original Date column format before conversion
-        original_dates = df['Date'].copy()
-
         # Convert Date column to datetime with flexible parsing (handles DD.MM.YYYY, YYYY-MM-DD, etc.)
         # dayfirst=True handles European date format like 17.11.2025
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True)
@@ -713,30 +720,26 @@ def process_file(job_config: Dict[str, Any], flow_map: Dict[str, float], target_
         if adjusted_total_col:
             df = update_statistics_table(df, sheet_name, adjusted_total_col, vwap_col_for_stats)
 
-        # Convert Date column to string format "DD MMM YYYY" (e.g., "17 Nov 2025")
-        # But preserve original format for certain sheets
-        preserve_date_format_sheets = ['BOFA']
+        # Sheets that should not be edited at all
+        skip_edit_sheets = ['DIN', 'TR', 'BOFA']
 
-        if 'Date' in df.columns and sheet_name not in preserve_date_format_sheets:
+        if sheet_name in skip_edit_sheets:
+            print(f"[INFO] Skipping edit for {sheet_name} (in skip list)")
+            return
+
+        # Convert Date column to string format "DD MMM YYYY" (e.g., "17 Nov 2025")
+        if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%d %b %Y')
 
         # Save the updated DataFrame back to the Excel sheet
         # We need to read all sheets, update the specific one, and write back
-        preserve_date_format_sheets = ['BOFA']
-
         with pd.ExcelFile(workbook_name, engine='openpyxl') as xls:
-            all_sheets = {}
-            for sheet in xls.sheet_names:
-                # For sheets with preserved date format, read Date column as string
-                if sheet in preserve_date_format_sheets:
-                    all_sheets[sheet] = pd.read_excel(xls, sheet_name=sheet, dtype={'Date': str})
-                else:
-                    all_sheets[sheet] = pd.read_excel(xls, sheet_name=sheet)
+            all_sheets = {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
 
-        # Update the specific sheet
+        # Update the specific sheet with our modified df (includes statistics tables)
         all_sheets[sheet_name] = df
 
-        # Write all sheets back to the workbook (dates are now strings)
+        # Write all sheets back to the workbook
         with pd.ExcelWriter(workbook_name, engine='openpyxl', mode='w') as writer:
             for sheet, data in all_sheets.items():
                 data.to_excel(writer, sheet_name=sheet, index=False)
@@ -806,8 +809,9 @@ def format_statistics_table_in_sheet(workbook_path: str, sheet_name: str) -> Non
                             flow_cell.alignment = right_align
                             flow_cell.border = thin_border
                             flow_cell.number_format = '#,##0.00'
-                            # Apply conditional formatting
-                            flow_cell.fill = green_fill if flow_val >= 0 else red_fill
+                            # Apply conditional formatting (no color for 0)
+                            if flow_val != 0:
+                                flow_cell.fill = green_fill if flow_val > 0 else red_fill
                         except (ValueError, TypeError):
                             flow_cell.alignment = right_align
                             flow_cell.border = thin_border
@@ -846,13 +850,19 @@ def create_all_statistics_sheet(workbook_path: str, sheet_names: list) -> None:
     # Read all sheets to collect statistics
     all_stats = []
 
-    # Exclude these sheets from ALL
-    exclude_sheets = ['IBIT', 'SOL', 'ETHA', 'BOFA']
+    # Define exact order from screenshot
+    ordered_sheets = [
+        'S&P 500 ETF', 'Nasdaq 100 ETF', 'Russel 2000 ETF', 'Bonds',
+        'NVDA', 'AVGO', 'TSLA', 'META',
+        'AAPL', 'MSFT', 'GOOG', 'PANW',
+        'SEMIC', 'Gold ETF', 'Silver ETF', 'Brent ETF',
+        'Natural Gas', 'Palladium ETF', 'Platinum ETF', 'Copper ETF'
+    ]
 
     with pd.ExcelFile(workbook_path, engine='openpyxl') as xls:
-        for sheet_name in sheet_names:
-            # Skip excluded sheets
-            if sheet_name in exclude_sheets:
+        for sheet_name in ordered_sheets:
+            # Skip if sheet doesn't exist in workbook
+            if sheet_name not in xls.sheet_names:
                 continue
 
             try:
@@ -977,8 +987,8 @@ def create_all_statistics_sheet(workbook_path: str, sheet_names: list) -> None:
         cell.alignment = right_align
         cell.border = thin_border
         cell.number_format = '#,##0.00' if cell.value else ''
-        if cell.value is not None:
-            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+        if cell.value is not None and float(cell.value) != 0:
+            cell.fill = green_fill if float(cell.value) > 0 else red_fill
 
         cell = ws.cell(row=start_row + 1, column=start_col + 2)
         cell.value = stats['last_day_vwap']
@@ -998,8 +1008,8 @@ def create_all_statistics_sheet(workbook_path: str, sheet_names: list) -> None:
         cell.alignment = right_align
         cell.border = thin_border
         cell.number_format = '#,##0.00' if cell.value else ''
-        if cell.value is not None:
-            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+        if cell.value is not None and float(cell.value) != 0:
+            cell.fill = green_fill if float(cell.value) > 0 else red_fill
 
         cell = ws.cell(row=start_row + 2, column=start_col + 2)
         cell.value = stats['last_5_vwap']
@@ -1019,8 +1029,8 @@ def create_all_statistics_sheet(workbook_path: str, sheet_names: list) -> None:
         cell.alignment = right_align
         cell.border = thin_border
         cell.number_format = '#,##0.00' if cell.value else ''
-        if cell.value is not None:
-            cell.fill = green_fill if float(cell.value) >= 0 else red_fill
+        if cell.value is not None and float(cell.value) != 0:
+            cell.fill = green_fill if float(cell.value) > 0 else red_fill
 
         cell = ws.cell(row=start_row + 3, column=start_col + 2)
         cell.value = stats['last_20_vwap']
